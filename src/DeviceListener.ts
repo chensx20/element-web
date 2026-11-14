@@ -67,6 +67,9 @@ export default class DeviceListener {
     // The set of device IDs we're currently displaying toasts for
     private displayingToastsForDeviceIds = new Set<string>();
     private running = false;
+    private recheckGeneration = 0;
+    private lifecycleGeneration = 0;
+    private baselineFetchPending = false;
     private shouldRecordClientInformation = false;
     private enableBulkUnverifiedSessionsReminder = true;
     private deviceClientInformationSettingWatcherRef: string | undefined;
@@ -78,7 +81,11 @@ export default class DeviceListener {
 
     public start(): void {
         this.running = true;
-        MatrixClientPeg.get().on(CryptoEvent.WillUpdateDevices, this.onWillUpdateDevices);
+        this.recheckGeneration++;
+        this.lifecycleGeneration++;
+        const cli = MatrixClientPeg.get();
+        const devices = cli.getStoredDevicesForUser(cli.getUserId()!);
+        if (devices.length) this.ourDeviceIdsAtStart = new Set(devices.map((device) => device.deviceId));
         MatrixClientPeg.get().on(CryptoEvent.DevicesUpdated, this.onDevicesUpdated);
         MatrixClientPeg.get().on(CryptoEvent.DeviceVerificationChanged, this.onDeviceVerificationChanged);
         MatrixClientPeg.get().on(CryptoEvent.UserTrustStatusChanged, this.onUserTrustStatusChanged);
@@ -101,8 +108,10 @@ export default class DeviceListener {
 
     public stop(): void {
         this.running = false;
+        this.recheckGeneration++;
+        this.lifecycleGeneration++;
+        this.baselineFetchPending = false;
         if (MatrixClientPeg.get()) {
-            MatrixClientPeg.get().removeListener(CryptoEvent.WillUpdateDevices, this.onWillUpdateDevices);
             MatrixClientPeg.get().removeListener(CryptoEvent.DevicesUpdated, this.onDevicesUpdated);
             MatrixClientPeg.get().removeListener(
                 CryptoEvent.DeviceVerificationChanged,
@@ -127,7 +136,10 @@ export default class DeviceListener {
         this.keyBackupFetchedAt = null;
         this.keyBackupStatusChecked = false;
         this.ourDeviceIdsAtStart = null;
-        this.displayingToastsForDeviceIds = new Set();
+        for (const deviceId of this.displayingToastsForDeviceIds) {
+            hideUnverifiedSessionsToast(deviceId);
+        }
+        this.displayingToastsForDeviceIds.clear();
     }
 
     /**
@@ -149,25 +161,24 @@ export default class DeviceListener {
         this.recheck();
     }
 
-    private ensureDeviceIdsAtStartPopulated(): void {
-        if (this.ourDeviceIdsAtStart === null) {
-            const cli = MatrixClientPeg.get();
-            this.ourDeviceIdsAtStart = new Set(cli.getStoredDevicesForUser(cli.getUserId()!).map((d) => d.deviceId));
+    private async fetchStartupDevices(): Promise<void> {
+        if (this.baselineFetchPending || this.ourDeviceIdsAtStart !== null) return;
+        this.baselineFetchPending = true;
+        const generation = this.lifecycleGeneration;
+        const cli = MatrixClientPeg.get();
+        const userId = cli.getUserId()!;
+        try {
+            const devicesByUser = await cli.downloadKeys([userId], true);
+            if (!this.running || generation !== this.lifecycleGeneration) return;
+            this.ourDeviceIdsAtStart = new Set(devicesByUser.get(userId)!.keys());
+            this.baselineFetchPending = false;
+            this.recheck();
+        } catch (error) {
+            if (!this.running || generation !== this.lifecycleGeneration) return;
+            this.baselineFetchPending = false;
+            logger.error("Failed to fetch startup devices", error);
         }
     }
-
-    private onWillUpdateDevices = async (users: string[], initialFetch?: boolean): Promise<void> => {
-        // If we didn't know about *any* devices before (ie. it's fresh login),
-        // then they are all pre-existing devices, so ignore this and set the
-        // devicesAtStart list to the devices that we see after the fetch.
-        if (initialFetch) return;
-
-        const myUserId = MatrixClientPeg.get().getUserId()!;
-        if (users.includes(myUserId)) this.ensureDeviceIdsAtStartPopulated();
-
-        // No need to do a recheck here: we just need to get a snapshot of our devices
-        // before we download any new ones.
-    };
 
     private onDevicesUpdated = (users: string[]): void => {
         if (!users.includes(MatrixClientPeg.get().getUserId()!)) return;
@@ -249,10 +260,12 @@ export default class DeviceListener {
 
     private async recheck(): Promise<void> {
         if (!this.running) return; // we have been stopped
+        const generation = ++this.recheckGeneration;
         const cli = MatrixClientPeg.get();
 
         // cross-signing support was added to Matrix in MSC1756, which landed in spec v1.1
         if (!(await cli.isVersionSupported("v1.1"))) return;
+        if (!this.running || generation !== this.recheckGeneration) return;
 
         if (!cli.isCryptoEnabled()) return;
         // don't recheck until the initial sync is complete: lots of account data events will fire
@@ -260,8 +273,11 @@ export default class DeviceListener {
         // (we add a listener on sync to do once check after the initial sync is done)
         if (!cli.isInitialSyncComplete()) return;
 
+        if (this.ourDeviceIdsAtStart === null) this.fetchStartupDevices();
+
         const crossSigningReady = await cli.isCrossSigningReady();
         const secretStorageReady = await cli.isSecretStorageReady();
+        if (!this.running || generation !== this.recheckGeneration) return;
         const allSystemsReady = crossSigningReady && secretStorageReady;
 
         if (this.dismissedThisDeviceToast || allSystemsReady) {
@@ -271,6 +287,7 @@ export default class DeviceListener {
         } else if (this.shouldShowSetupEncryptionToast()) {
             // make sure our keys are finished downloading
             await cli.downloadKeys([cli.getUserId()!]);
+            if (!this.running || generation !== this.recheckGeneration) return;
             // cross signing isn't enabled - nag to enable it
             // There are 3 different toasts for:
             if (!cli.getCrossSigningId() && cli.getStoredCrossSigningForUser(cli.getUserId()!)) {
@@ -279,12 +296,14 @@ export default class DeviceListener {
                 this.checkKeyBackupStatus();
             } else {
                 const backupInfo = await this.getKeyBackupInfo();
+                if (!this.running || generation !== this.recheckGeneration) return;
                 if (backupInfo) {
                     // No cross-signing on account but key backup available (upgrade encryption)
                     showSetupEncryptionToast(SetupKind.UPGRADE_ENCRYPTION);
                 } else {
                     // No cross-signing or key backup on account (set up encryption)
                     await cli.waitForClientWellKnown();
+                    if (!this.running || generation !== this.recheckGeneration) return;
                     if (isSecureBackupRequired() && isLoggedIn()) {
                         // If we're meant to set up, and Secure Backup is required,
                         // trigger the flow directly without a toast once logged in.
@@ -296,10 +315,6 @@ export default class DeviceListener {
                 }
             }
         }
-
-        // This needs to be done after awaiting on downloadKeys() above, so
-        // we make sure we get the devices after the fetch is done.
-        this.ensureDeviceIdsAtStartPopulated();
 
         // Unverified devices that were there last time the app ran
         // (technically could just be a boolean: we don't actually
@@ -318,7 +333,7 @@ export default class DeviceListener {
 
         // as long as cross-signing isn't ready,
         // you can't see or dismiss any device toasts
-        if (crossSigningReady) {
+        if (crossSigningReady && this.ourDeviceIdsAtStart !== null) {
             const devices = cli.getStoredDevicesForUser(cli.getUserId()!);
             for (const device of devices) {
                 if (device.deviceId === cli.deviceId) continue;
@@ -335,6 +350,8 @@ export default class DeviceListener {
                 }
             }
         }
+
+        if (!this.running || generation !== this.recheckGeneration) return;
 
         logger.debug("Old unverified sessions: " + Array.from(oldUnverifiedDeviceIds).join(","));
         logger.debug("New unverified sessions: " + Array.from(newUnverifiedDeviceIds).join(","));
@@ -357,7 +374,7 @@ export default class DeviceListener {
 
         // Show toasts for new unverified devices if they aren't already there
         for (const deviceId of newUnverifiedDeviceIds) {
-            showUnverifiedSessionsToast(deviceId);
+            showUnverifiedSessionsToast(deviceId, () => this.running && generation === this.recheckGeneration);
         }
 
         // ...and hide any we don't need any more
