@@ -31,7 +31,7 @@ function toastKey(deviceId: string): string {
     return "unverified_session_" + deviceId;
 }
 
-export const showToast = async (deviceId: string): Promise<void> => {
+export const showToast = async (deviceId: string, isCurrent: () => boolean): Promise<void> => {
     const cli = MatrixClientPeg.get();
 
     const onAccept = (): void => {
@@ -46,11 +46,14 @@ export const showToast = async (deviceId: string): Promise<void> => {
     };
 
     const device = await cli.getDevice(deviceId);
+    if (!isCurrent()) return;
+
     const extendedDevice = {
         ...device,
         isVerified: await isDeviceVerified(cli, deviceId),
         deviceType: DeviceType.Unknown,
     };
+    if (!isCurrent()) return;
 
     ToastStore.sharedInstance().addOrReplaceToast({
         key: toastKey(deviceId),

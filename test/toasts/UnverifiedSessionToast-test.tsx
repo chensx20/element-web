@@ -25,6 +25,7 @@ import dis from "../../src/dispatcher/dispatcher";
 import { showToast } from "../../src/toasts/UnverifiedSessionToast";
 import { filterConsole, flushPromises, stubClient } from "../test-utils";
 import ToastContainer from "../../src/components/structures/ToastContainer";
+import ToastStore from "../../src/stores/ToastStore";
 import { Action } from "../../src/dispatcher/actions";
 import DeviceListener from "../../src/DeviceListener";
 
@@ -67,9 +68,29 @@ describe("UnverifiedSessionToast", () => {
         renderResult = render(<ToastContainer />);
     });
 
+    it("does not publish toast metadata after its request becomes stale", async () => {
+        showToast(otherDevice.device_id, () => false);
+        await flushPromises();
+
+        expect(screen.queryByText("New login. Was this you?")).not.toBeInTheDocument();
+    });
+
+    it("does not publish when metadata resolves after the request is invalidated", async () => {
+        let resolveDevice!: (device: IMyDevice) => void;
+        client.getDevice.mockReturnValueOnce(new Promise((resolve) => (resolveDevice = resolve)));
+        const addToast = jest.spyOn(ToastStore.sharedInstance(), "addOrReplaceToast");
+        let current = true;
+        const pendingToast = showToast(otherDevice.device_id, () => current);
+        current = false;
+        resolveDevice(otherDevice);
+        await pendingToast;
+        expect(addToast).not.toHaveBeenCalled();
+        addToast.mockRestore();
+    });
+
     describe("when rendering the toast", () => {
         beforeEach(async () => {
-            showToast(otherDevice.device_id);
+            showToast(otherDevice.device_id, () => true);
             await flushPromises();
         });
 

@@ -96,7 +96,7 @@ describe("DeviceListener", () => {
             getCrossSigningId: jest.fn(),
             getStoredCrossSigningForUser: jest.fn(),
             waitForClientWellKnown: jest.fn(),
-            downloadKeys: jest.fn(),
+            downloadKeys: jest.fn().mockResolvedValue(new Map([[userId, new Map()]])),
             isRoomEncrypted: jest.fn(),
             getClientWellKnown: jest.fn(),
             getDeviceId: jest.fn().mockReturnValue(deviceId),
@@ -284,6 +284,7 @@ describe("DeviceListener", () => {
             });
 
             it("does not do any checks or show any toasts when secret storage is being accessed", async () => {
+                mockClient!.getStoredDevicesForUser.mockReturnValue([new DeviceInfo(deviceId)]);
                 mocked(isSecretStorageBeingAccessed).mockReturnValue(true);
                 await createAndStart();
 
@@ -292,6 +293,7 @@ describe("DeviceListener", () => {
             });
 
             it("does not do any checks or show any toasts when no rooms are encrypted", async () => {
+                mockClient!.getStoredDevicesForUser.mockReturnValue([new DeviceInfo(deviceId)]);
                 mockClient!.isRoomEncrypted.mockReturnValue(false);
                 await createAndStart();
 
@@ -372,6 +374,7 @@ describe("DeviceListener", () => {
             });
 
             it("does not check key backup status again after check is complete", async () => {
+                mockClient!.getStoredDevicesForUser.mockReturnValue([new DeviceInfo(deviceId)]);
                 mockClient!.getKeyBackupEnabled.mockReturnValue(null);
                 const instance = await createAndStart();
                 expect(mockClient!.getKeyBackupEnabled).toHaveBeenCalled();
@@ -490,6 +493,7 @@ describe("DeviceListener", () => {
                         new Set<string>([device3.deviceId]),
                     );
                     expect(BulkUnverifiedSessionsToast.hideToast).not.toHaveBeenCalled();
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
                 });
 
                 it("hides toast when unverified sessions at app start have been dismissed", async () => {
@@ -512,6 +516,261 @@ describe("DeviceListener", () => {
                     await flushPromises();
 
                     expect(BulkUnverifiedSessionsToast.hideToast).toHaveBeenCalled();
+                });
+
+                it("shows an individual toast even when bulk reminders are disabled and snoozed", async () => {
+                    jest.spyOn(SettingsStore, "getValue").mockReturnValue(false);
+                    mocked(isBulkUnverifiedDeviceReminderSnoozed).mockReturnValue(true);
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = await createAndStart();
+
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device3.deviceId,
+                        expect.any(Function),
+                    );
+                    expect(BulkUnverifiedSessionsToast.showToast).not.toHaveBeenCalled();
+                    instance.stop();
+                });
+
+                it("classifies runtime additions against startup cache while readiness is pending", async () => {
+                    let resolveVersionSupport!: (supported: boolean) => void;
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockClient!.isVersionSupported.mockImplementation(
+                        () => new Promise((resolve) => (resolveVersionSupport = resolve)),
+                    );
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = new DeviceListener();
+                    instance.start();
+
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    resolveVersionSupport(true);
+                    await flushPromises();
+                    await flushPromises();
+
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device3.deviceId,
+                        expect.any(Function),
+                    );
+                    instance.stop();
+                });
+
+                it("uses the cache at startup as the immutable baseline", async () => {
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    await createAndStart();
+
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+                    expect(BulkUnverifiedSessionsToast.showToast).not.toHaveBeenCalled();
+                });
+
+                it("uses the first successful own-user fetch as the baseline after an empty startup cache", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    let resolveFetch!: (devices: Map<string, Map<string, DeviceInfo>>) => void;
+                    mockClient!.downloadKeys.mockReturnValue(new Promise((resolve) => (resolveFetch = resolve)));
+                    const instance = await createAndStart();
+
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], true);
+                    resolveFetch(
+                        new Map([[userId, new Map([currentDevice, device2, device3].map((d) => [d.deviceId, d]))]]),
+                    );
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+
+                    const device4 = new DeviceInfo("d4");
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3, device4]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device4.deviceId,
+                        expect.any(Function),
+                    );
+                    instance.stop();
+                });
+
+                it("starts a new baseline fetch after restart while the old fetch is unresolved", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    let resolveOldFetch!: (devices: Map<string, Map<string, DeviceInfo>>) => void;
+                    let resolveNewFetch!: (devices: Map<string, Map<string, DeviceInfo>>) => void;
+                    mockClient!.downloadKeys
+                        .mockReturnValueOnce(new Promise((resolve) => (resolveOldFetch = resolve)))
+                        .mockReturnValueOnce(new Promise((resolve) => (resolveNewFetch = resolve)));
+                    const instance = await createAndStart();
+                    expect(mockClient!.downloadKeys).toHaveBeenCalledTimes(1);
+                    instance.stop();
+                    instance.start();
+                    await flushPromises();
+                    expect(mockClient!.downloadKeys).toHaveBeenCalledTimes(2);
+
+                    resolveOldFetch(new Map([[userId, new Map([[currentDevice.deviceId, currentDevice]])]]));
+                    await flushPromises();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    expect(mockClient!.downloadKeys).toHaveBeenCalledTimes(2);
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+
+                    resolveNewFetch(new Map([[userId, new Map([currentDevice, device2].map((d) => [d.deviceId, d]))]]));
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device3.deviceId,
+                        expect.any(Function),
+                    );
+                    instance.stop();
+                });
+
+                it("does not publish a toast after stop while verification is pending", async () => {
+                    let resolveVerification!: (status: DeviceVerificationStatus) => void;
+                    mockCrypto!.getDeviceVerificationStatus.mockImplementation(
+                        () => new Promise((resolve) => (resolveVerification = resolve)),
+                    );
+                    const instance = new DeviceListener();
+                    instance.start();
+                    instance.stop();
+                    resolveVerification?.(deviceTrustUnverified);
+                    await flushPromises();
+
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+                });
+
+                it("does not initialize the baseline on a failed own-user fetch", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([]);
+                    let rejectFetch!: (error: Error) => void;
+                    mockClient!.downloadKeys.mockReturnValueOnce(
+                        new Promise((_resolve, reject) => (rejectFetch = reject)),
+                    );
+                    const instance = await createAndStart();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], true);
+                    rejectFetch(new Error("fetch failed"));
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+                    expect(logger.error).toHaveBeenCalledWith("Failed to fetch startup devices", expect.any(Error));
+                    instance.stop();
+                });
+
+                it("ignores an older recheck when a device is removed during verification", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = await createAndStart();
+                    let resolveVerification!: (status: DeviceVerificationStatus) => void;
+                    mockCrypto!.getDeviceVerificationStatus.mockImplementation((_user, id) => {
+                        if (id === device3.deviceId) {
+                            return new Promise((resolve) => (resolveVerification = resolve));
+                        }
+                        return Promise.resolve(deviceTrustUnverified);
+                    });
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    resolveVerification(deviceTrustUnverified);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+                    instance.stop();
+                });
+
+                it("hides an individual toast when its device is removed", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = await createAndStart();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device3.deviceId,
+                        expect.any(Function),
+                    );
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.hideToast).toHaveBeenCalledWith(device3.deviceId);
+                    instance.stop();
+                });
+
+                it("invalidates pending toast work after restart", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = await createAndStart();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    const isCurrent = mocked(UnverifiedSessionToast.showToast).mock.calls[0][1];
+                    expect(isCurrent()).toBe(true);
+                    instance.stop();
+                    instance.start();
+                    expect(isCurrent()).toBe(false);
+                    await flushPromises();
+                    instance.stop();
+                });
+
+                it("hides the individual toast after a new device is verified", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = await createAndStart();
+
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device3.deviceId,
+                        expect.any(Function),
+                    );
+
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustVerified);
+                    mockClient!.emit(CryptoEvent.DeviceVerificationChanged, userId, device3.deviceId, device3);
+                    await flushPromises();
+                    expect(UnverifiedSessionToast.hideToast).toHaveBeenCalledWith(device3.deviceId);
+                    instance.stop();
+                });
+
+                it("hides the individual toast after dismissing a new device", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    const instance = await createAndStart();
+
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    await flushPromises();
+                    await instance.dismissUnverifiedSessions([device3.deviceId]);
+                    await flushPromises();
+
+                    expect(UnverifiedSessionToast.hideToast).toHaveBeenCalledWith(device3.deviceId);
+                    instance.stop();
+                });
+
+                it("does not initialize the startup baseline from unrelated-user updates", async () => {
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([]);
+                    mockCrypto!.getDeviceVerificationStatus.mockResolvedValue(deviceTrustUnverified);
+                    let resolveFetch!: (devices: Map<string, Map<string, DeviceInfo>>) => void;
+                    mockClient!.downloadKeys.mockReturnValue(new Promise((resolve) => (resolveFetch = resolve)));
+                    const instance = await createAndStart();
+
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, ["@other:server"], false);
+                    await flushPromises();
+                    mockClient!.getStoredDevicesForUser.mockReturnValue([currentDevice, device2, device3]);
+                    mockClient!.emit(CryptoEvent.DevicesUpdated, [userId], false);
+                    resolveFetch(
+                        new Map([[userId, new Map([currentDevice, device2, device3].map((d) => [d.deviceId, d]))]]),
+                    );
+                    await flushPromises();
+
+                    expect(UnverifiedSessionToast.showToast).not.toHaveBeenCalled();
+                    instance.stop();
                 });
 
                 it("hides toast when unverified sessions are added after app start", async () => {
@@ -541,6 +800,10 @@ describe("DeviceListener", () => {
                     // individual nags are shown for new unverified devices
                     expect(BulkUnverifiedSessionsToast.hideToast).toHaveBeenCalledTimes(2);
                     expect(BulkUnverifiedSessionsToast.showToast).not.toHaveBeenCalled();
+                    expect(UnverifiedSessionToast.showToast).toHaveBeenCalledWith(
+                        device3.deviceId,
+                        expect.any(Function),
+                    );
                 });
             });
         });
