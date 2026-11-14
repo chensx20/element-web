@@ -15,13 +15,17 @@ limitations under the License.
 */
 
 import React, { ReactNode } from "react";
-import { AutoDiscovery, ClientConfig } from "matrix-js-sdk/src/autodiscovery";
+import { AutoDiscovery, AutoDiscoveryAction, ClientConfig } from "matrix-js-sdk/src/autodiscovery";
 import { logger } from "matrix-js-sdk/src/logger";
 import { IClientWellKnown } from "matrix-js-sdk/src/matrix";
 
 import { _t, UserFriendlyError } from "../languageHandler";
 import SdkConfig from "../SdkConfig";
-import { ValidatedServerConfig } from "./ValidatedServerConfig";
+import { DelegatedAuthenticationConfig, ValidatedServerConfig } from "./ValidatedServerConfig";
+
+interface AuthenticationDiscoveryResult extends DelegatedAuthenticationConfig {
+    state: AutoDiscoveryAction;
+}
 
 const LIVELINESS_DISCOVERY_ERRORS: string[] = [
     AutoDiscovery.ERROR_INVALID_HOMESERVER,
@@ -203,6 +207,7 @@ export default class AutoDiscoveryUtils {
 
         const hsResult = discoveryResult["m.homeserver"];
         const isResult = discoveryResult["m.identity_server"];
+        const authResult: AuthenticationDiscoveryResult | undefined = discoveryResult["m.authentication"];
 
         const defaultConfig = SdkConfig.get("validated_server_config");
 
@@ -268,6 +273,15 @@ export default class AutoDiscoveryUtils {
             isDefault: false,
             warning: hsResult.error,
             isNameResolvable: !isSynthetic,
+            ...(authResult?.state === AutoDiscovery.SUCCESS && {
+                delegatedAuthentication: {
+                    authorizationEndpoint: authResult.authorizationEndpoint,
+                    registrationEndpoint: authResult.registrationEndpoint,
+                    tokenEndpoint: authResult.tokenEndpoint,
+                    issuer: authResult.issuer,
+                    account: authResult.account,
+                },
+            }),
         } as ValidatedServerConfig;
     }
 }
