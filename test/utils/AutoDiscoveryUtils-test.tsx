@@ -169,6 +169,58 @@ describe("AutoDiscoveryUtils", () => {
             });
         });
 
+        it("preserves successful delegated authentication metadata", () => {
+            const metadata = {
+                authorizationEndpoint: "https://auth.example/authorize?x=1",
+                registrationEndpoint: "https://auth.example/register/",
+                tokenEndpoint: "https://auth.example/token",
+                issuer: "https://auth.example/",
+                account: "https://auth.example/account",
+            };
+            const discoveryResult = {
+                ...validHsConfig,
+                ...validIsConfig,
+                "m.authentication": {
+                    ...metadata,
+                    state: AutoDiscoveryAction.SUCCESS,
+                    unrelated: "not copied",
+                },
+            };
+
+            expect(AutoDiscoveryUtils.buildValidatedConfigFromDiscovery(serverName, discoveryResult)).toEqual({
+                ...expectedValidatedConfig,
+                delegatedAuthentication: metadata,
+            });
+        });
+
+        it("omits delegated authentication when the block is absent", () => {
+            const config = AutoDiscoveryUtils.buildValidatedConfigFromDiscovery(serverName, {
+                ...validHsConfig,
+                ...validIsConfig,
+            });
+
+            expect(config).not.toHaveProperty("delegatedAuthentication");
+        });
+
+        it.each([
+            AutoDiscoveryAction.IGNORE,
+            AutoDiscoveryAction.PROMPT,
+            AutoDiscoveryAction.FAIL_PROMPT,
+            AutoDiscoveryAction.FAIL_ERROR,
+        ])("omits delegated authentication when discovery state is %s", (state) => {
+            const discoveryResult = {
+                ...validHsConfig,
+                ...validIsConfig,
+                "m.authentication": {
+                    state,
+                    authorizationEndpoint: "https://auth.example/authorize",
+                },
+            };
+            const config = AutoDiscoveryUtils.buildValidatedConfigFromDiscovery(serverName, discoveryResult);
+
+            expect(config).not.toHaveProperty("delegatedAuthentication");
+        });
+
         it("ignores liveliness error when checking syntax only", () => {
             const discoveryResult = {
                 ...validIsConfig,

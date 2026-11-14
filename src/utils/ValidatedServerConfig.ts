@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+export interface DelegatedAuthenticationConfig {
+    authorizationEndpoint?: string;
+    registrationEndpoint?: string;
+    tokenEndpoint?: string;
+    issuer?: string;
+    account?: string;
+}
+
 export interface ValidatedServerConfig {
     hsUrl: string;
     hsName: string;
@@ -24,6 +32,8 @@ export interface ValidatedServerConfig {
     isDefault: boolean;
     // when the server config is based on static URLs the hsName is not resolvable and things may wish to use hsUrl
     isNameResolvable: boolean;
+
+    delegatedAuthentication?: DelegatedAuthenticationConfig;
 
     warning: string | Error;
 }
